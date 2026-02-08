@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew:*)",
+      "Bash(adb:*)",
+      "Bash(\"$ANDROID_HOME/platform-tools/adb.exe\":*)",
+      "Bash(kotlinc:*)",
+      "Bash(tr:*)",
+      "Bash(awk:*)",
+      "Bash(python3:*)",
+      "Bash(git init:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
