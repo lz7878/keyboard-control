@@ -14,10 +14,13 @@ import com.example.autoplaymate.ble.KeyCodes
 import com.example.autoplaymate.ble.KeyModifier
 import com.example.autoplaymate.data.ScriptDataManager
 import com.example.autoplaymate.data.ScriptStepData
+import com.example.autoplaymate.data.StepType
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 键盘控制 ViewModel
@@ -51,10 +54,22 @@ class KeyboardViewModel(
     private val _loopEnabled = MutableStateFlow(false)
     val loopEnabled: StateFlow<Boolean> = _loopEnabled.asStateFlow()
 
+    // 管理异步重复任务的 Map
+    private val asyncJobs = ConcurrentHashMap<String, Job>()
+
+    // 脚本模板列表
+    private val _scriptTemplates = MutableStateFlow<List<com.example.autoplaymate.data.ScriptTemplate>>(emptyList())
+    val scriptTemplates: StateFlow<List<com.example.autoplaymate.data.ScriptTemplate>> = _scriptTemplates.asStateFlow()
+
+    // 当前正在编辑的脚本（如果有）
+    private var currentEditingTemplateId: String? = null
+
     init {
         // 加载保存的脚本数据
         _scriptSteps.value = scriptDataManager.loadScriptSteps()
         _loopEnabled.value = scriptDataManager.loadLoopEnabled()
+        // 加载脚本模板列表
+        loadScriptTemplates()
     }
 
     /**
@@ -63,7 +78,10 @@ class KeyboardViewModel(
     data class ScriptStep(
         val delayMs: Long,
         val keycode: Byte,
-        val modifier: Byte = 0
+        val modifier: Byte = 0,
+        val isAsyncRepeat: Boolean = false,      // 是否是异步重复步骤
+        val repeatCount: Int = 0,                // 重复次数
+        val repeatIntervalMs: Long = 0           // 重复间隔毫秒
     )
 
     /**
@@ -162,7 +180,7 @@ class KeyboardViewModel(
                 _lastAction.value = "发送组合键失败"
                 return@launch
             }
-            kotlinx.coroutines.delay(50)
+            kotlinx.coroutines.delay(20)
             // 释放所有键
             if (!bleManager.sendKeyReport(0, 0)) {
                 _lastAction.value = "发送组合键失败"
@@ -246,8 +264,14 @@ class KeyboardViewModel(
         viewModelScope.launch {
             _isScriptRunning.value = true
             try {
+                // 开始前先清理可能存在的旧异步任务
+                stopAllAsyncJobs()
+
                 do {
-                    for (step in steps) {
+                    // 每轮循环开始前，清理上一轮的异步任务
+                    stopAllAsyncJobs()
+
+                    for ((index, step) in steps.withIndex()) {
                         if (!_isScriptRunning.value) break
 
                         // 延迟指定时间
@@ -255,9 +279,18 @@ class KeyboardViewModel(
 
                         // 如果 keycode 不为 0，发送按键（keycode 为 0 表示纯延时）
                         if (step.keycode != 0.toByte()) {
-                            bleManager.sendKeyPress(step.keycode, step.modifier)
+                            // 检查是否是异步重复步骤
+                            if (step.isAsyncRepeat) {
+                                // 启动异步重复任务
+                                val jobId = "async_${System.currentTimeMillis()}_$index"
+                                startAsyncRepeatJob(jobId, step.keycode, step.modifier, step.repeatCount, step.repeatIntervalMs)
+                            } else {
+                                // 普通步骤，同步执行
+                                bleManager.sendKeyPress(step.keycode, step.modifier)
+                            }
                         }
                     }
+
                     // 如果不是循环模式，执行完一次就退出
                     if (!loop) break
 
@@ -266,13 +299,61 @@ class KeyboardViewModel(
                         kotlinx.coroutines.delay(1000) // 每轮间隔1秒
                     }
                 } while (_isScriptRunning.value && loop)
+
+                // 等待所有异步任务完成后再结束
+                waitForAllAsyncJobs()
                 _lastAction.value = "脚本执行完成"
             } catch (e: Exception) {
                 _lastAction.value = "脚本执行出错: ${e.message}"
             } finally {
                 _isScriptRunning.value = false
+                // 最终清理：停止所有异步任务
+                stopAllAsyncJobs()
             }
         }
+    }
+
+    /**
+     * 等待所有异步任务完成
+     */
+    private suspend fun waitForAllAsyncJobs() {
+        if (asyncJobs.isEmpty()) return
+
+        _lastAction.value = "等待异步任务完成..."
+        asyncJobs.values.forEach { it.join() }
+        asyncJobs.clear()
+    }
+
+    /**
+     * 启动异步重复按键任务
+     */
+    private fun startAsyncRepeatJob(
+        jobId: String,
+        keycode: Byte,
+        modifier: Byte,
+        repeatCount: Int,
+        intervalMs: Long
+    ) {
+        val job = viewModelScope.launch {
+            _lastAction.value = "启动异步重复: ${repeatCount}次, ${intervalMs}ms间隔"
+            repeat(repeatCount) { index ->
+                if (!_isScriptRunning.value) return@launch
+                bleManager.sendKeyPress(keycode, modifier)
+                if (index < repeatCount - 1) {
+                    kotlinx.coroutines.delay(intervalMs)
+                }
+            }
+        }
+        asyncJobs[jobId] = job
+    }
+
+    /**
+     * 停止所有异步任务
+     */
+    private fun stopAllAsyncJobs() {
+        asyncJobs.values.forEach { it.cancel() }
+        asyncJobs.clear()
+        _lastAction.value = "所有异步任务已停止"
     }
 
     /**
@@ -398,4 +479,70 @@ class KeyboardViewModel(
             else -> null
         }
     }
+
+    // ========== 脚本模板管理 ==========
+
+    /**
+     * 加载脚本模板列表
+     */
+    private fun loadScriptTemplates() {
+        _scriptTemplates.value = scriptDataManager.getScriptTemplates()
+    }
+
+    /**
+     * 保存当前脚本为模板
+     */
+    fun saveAsScriptTemplate(name: String) {
+        val template = com.example.autoplaymate.data.ScriptTemplate(
+            id = currentEditingTemplateId ?: java.util.UUID.randomUUID().toString(),
+            name = name,
+            steps = _scriptSteps.value,
+            loopEnabled = _loopEnabled.value
+        )
+        scriptDataManager.saveScriptTemplate(template)
+        loadScriptTemplates()
+        _lastAction.value = "脚本已保存: $name"
+        currentEditingTemplateId = template.id
+    }
+
+    /**
+     * 加载脚本模板
+     */
+    fun loadScriptTemplate(templateId: String) {
+        val template = scriptDataManager.getScriptTemplate(templateId)
+        if (template != null) {
+            _scriptSteps.value = template.steps
+            _loopEnabled.value = template.loopEnabled
+            currentEditingTemplateId = templateId
+            _lastAction.value = "已加载脚本: ${template.name}"
+        }
+    }
+
+    /**
+     * 删除脚本模板
+     */
+    fun deleteScriptTemplate(templateId: String) {
+        scriptDataManager.deleteScriptTemplate(templateId)
+        loadScriptTemplates()
+        // 如果删除的是当前正在编辑的脚本，清除标记
+        if (currentEditingTemplateId == templateId) {
+            currentEditingTemplateId = null
+        }
+        _lastAction.value = "脚本已删除"
+    }
+
+    /**
+     * 创建新脚本（清空当前编辑）
+     */
+    fun createNewScript() {
+        _scriptSteps.value = emptyList()
+        _loopEnabled.value = false
+        currentEditingTemplateId = null
+        _lastAction.value = "已创建新脚本"
+    }
+
+    /**
+     * 获取当前正在编辑的模板ID
+     */
+    fun getCurrentEditingTemplateId(): String? = currentEditingTemplateId
 }

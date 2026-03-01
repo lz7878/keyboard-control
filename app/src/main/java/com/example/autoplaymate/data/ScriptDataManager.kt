@@ -64,7 +64,67 @@ class ScriptDataManager(context: Context) {
         private const val PREFS_NAME = "script_config"
         private const val KEY_SCRIPT_STEPS = "script_steps"
         private const val KEY_LOOP_ENABLED = "loop_enabled"
+        private const val KEY_SCRIPT_TEMPLATES = "script_templates"
     }
+
+    // ========== 脚本模板管理 ==========
+
+    /**
+     * 获取所有保存的脚本模板
+     */
+    fun getScriptTemplates(): List<ScriptTemplate> {
+        val json = prefs.getString(KEY_SCRIPT_TEMPLATES, null)
+        return if (json != null) {
+            val type = object : TypeToken<List<ScriptTemplate>>() {}.type
+            gson.fromJson(json, type) ?: emptyList()
+        } else {
+            emptyList()
+        }
+    }
+
+    /**
+     * 保存脚本模板
+     */
+    fun saveScriptTemplate(template: ScriptTemplate) {
+        val templates = getScriptTemplates().toMutableList()
+        val existingIndex = templates.indexOfFirst { it.id == template.id }
+
+        val updatedTemplate = template.copy(modifiedTime = System.currentTimeMillis())
+
+        if (existingIndex >= 0) {
+            templates[existingIndex] = updatedTemplate
+        } else {
+            templates.add(updatedTemplate)
+        }
+
+        val json = gson.toJson(templates)
+        prefs.edit().putString(KEY_SCRIPT_TEMPLATES, json).apply()
+    }
+
+    /**
+     * 删除脚本模板
+     */
+    fun deleteScriptTemplate(templateId: String) {
+        val templates = getScriptTemplates().toMutableList()
+        templates.removeIf { it.id == templateId }
+        val json = gson.toJson(templates)
+        prefs.edit().putString(KEY_SCRIPT_TEMPLATES, json).apply()
+    }
+
+    /**
+     * 获取单个脚本模板
+     */
+    fun getScriptTemplate(templateId: String): ScriptTemplate? {
+        return getScriptTemplates().firstOrNull { it.id == templateId }
+    }
+}
+
+/**
+ * 脚本步骤类型
+ */
+enum class StepType {
+    NORMAL,        // 普通步骤：延时后执行一次按键
+    ASYNC_REPEAT   // 异步重复：后台重复执行按键，不阻塞后续步骤
 }
 
 /**
@@ -72,5 +132,8 @@ class ScriptDataManager(context: Context) {
  */
 data class ScriptStepData(
     val delayMs: Long,
-    val keyName: String?
+    val keyName: String?,
+    val stepType: String = StepType.NORMAL.name,  // 步骤类型
+    val repeatCount: Int = 0,                     // 重复次数（仅 ASYNC_REPEAT 使用）
+    val repeatIntervalMs: Long = 0                // 重复间隔毫秒（仅 ASYNC_REPEAT 使用）
 )

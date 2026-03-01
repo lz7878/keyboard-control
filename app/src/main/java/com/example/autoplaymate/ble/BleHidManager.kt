@@ -14,7 +14,11 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.UUID
+import kotlin.coroutines.resume
 
 /**
  * BLE HID 键盘管理器
@@ -38,6 +42,8 @@ class BleHidManager(private val context: Context) {
 
         // HID 键盘报告 ID
         private const val KEYBOARD_REPORT_ID: Byte = 0x01
+
+        // 报告长度：带 Report ID 为 8 字节
         private const val REPORT_LENGTH = 8
     }
 
@@ -50,6 +56,15 @@ class BleHidManager(private val context: Context) {
 
     private var bluetoothGatt: BluetoothGatt? = null
     private var reportCharacteristic: BluetoothGattCharacteristic? = null
+
+    // 用于追踪正在连接的 GATT 实例，避免旧连接断开影响新连接
+    private var pendingConnectionGatt: BluetoothGatt? = null
+
+    // 用于确保写入操作串行化的互斥锁
+    private val writeMutex = Mutex()
+
+    // 用于等待写入完成的回调
+    private var writeCallback: ((Boolean) -> Unit)? = null
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -178,11 +193,26 @@ class BleHidManager(private val context: Context) {
     fun connect(device: BluetoothDevice) {
         _connectionState.value = ConnectionState.Connecting
 
-        // 断开之前的连接
-        disconnect()
+        // 保存当前的 GATT（稍后会变成"旧的"）
+        val oldGatt = bluetoothGatt
 
-        bluetoothGatt = device.connectGatt(context, false, gattCallback)
-        Log.d(TAG, "正在连接到设备: ${device.name ?: "未知"}")
+        // 先直接关闭旧连接，避免延迟关闭影响新连接
+        try {
+            oldGatt?.disconnect()
+            oldGatt?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "关闭旧连接时出错", e)
+        }
+        bluetoothGatt = null
+        reportCharacteristic = null
+
+        // 短暂延迟，确保旧连接完全关闭
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            // 创建新连接并记录为待定连接
+            val newGatt = device.connectGatt(context, false, gattCallback)
+            pendingConnectionGatt = newGatt
+            Log.d(TAG, "正在连接到设备: ${device.name ?: "未知"} (GATT: ${System.identityHashCode(newGatt)})")
+        }, 100)
     }
 
     /**
@@ -191,25 +221,39 @@ class BleHidManager(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun disconnect() {
         try {
-            bluetoothGatt?.disconnect()
-            bluetoothGatt?.close()
+            // 断开前先释放所有按键，防止残留状态
+            releaseAllKeys()
+
+            // 清除待定连接标记，允许断开完成
+            pendingConnectionGatt = null
+
+            // 短暂延迟确保释放报告发送成功
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                bluetoothGatt?.disconnect()
+                bluetoothGatt?.close()
+                bluetoothGatt = null
+                reportCharacteristic = null
+                _connectedDevice.value = null
+                _connectionState.value = ConnectionState.Disconnected
+                Log.d(TAG, "主动断开连接完成")
+            }, 50)
         } catch (e: Exception) {
             Log.e(TAG, "断开连接时出错", e)
-        } finally {
             bluetoothGatt = null
             reportCharacteristic = null
+            pendingConnectionGatt = null
             _connectedDevice.value = null
             _connectionState.value = ConnectionState.Disconnected
         }
     }
 
     /**
-     * 发送键盘报告
+     * 发送键盘报告（等待写入完成）
      * @param modifier 修饰键 (Ctrl, Alt, Shift, Win) 的位掩码
      * @param keycode 按键码
      */
     @SuppressLint("MissingPermission")
-    fun sendKeyReport(modifier: Byte, keycode: Byte): Boolean {
+    suspend fun sendKeyReport(modifier: Byte, keycode: Byte): Boolean = writeMutex.withLock {
         val characteristic = reportCharacteristic ?: run {
             Log.w(TAG, "报告特征值未找到")
             return false
@@ -220,33 +264,46 @@ class BleHidManager(private val context: Context) {
             return false
         }
 
-        try {
-            // 构造 HID 键盘报告
-            // 格式: [Report ID(1), 修饰键(1), 保留(1), 按键码1(1), 按键码2(1), 按键码3(1), 按键码4(1), 按键码5(1), 按键码6(1)]
-            val report = ByteArray(REPORT_LENGTH)
-            report[0] = KEYBOARD_REPORT_ID
-            report[1] = modifier
-            report[2] = 0x00
-            report[3] = keycode
-            report[4] = 0x00
-            report[5] = 0x00
-            report[6] = 0x00
-            report[7] = 0x00
+        return suspendCancellableCoroutine { continuation ->
+            try {
+                // 构造 HID 键盘报告（带 Report ID 的8字节格式）
+                // [Report ID(1), 修饰键(1), 保留(1), 按键码1(1), 按键码2(1), 按键码3(1), 按键码4(1), 按键码5(1), 按键码6(1)]
+                val report = ByteArray(REPORT_LENGTH)
+                report[0] = KEYBOARD_REPORT_ID
+                report[1] = modifier
+                report[2] = 0x00
+                report[3] = keycode
+                report[4] = 0x00
+                report[5] = 0x00
+                report[6] = 0x00
+                report[7] = 0x00
 
-            characteristic.value = report
-            val success = gatt.writeCharacteristic(characteristic)
+                characteristic.value = report
+                writeCallback = { success ->
+                    if (success) {
+                        Log.d(TAG, "发送键盘报告成功: modifier=0x${modifier.toString(16)}, keycode=0x${keycode.toString(16)}")
+                    } else {
+                        Log.e(TAG, "发送键盘报告失败")
+                    }
+                    continuation.resume(success)
+                }
 
-            if (success) {
-                Log.d(TAG, "发送键盘报告: modifier=0x${modifier.toString(16)}, keycode=0x${keycode.toString(16)}")
-            } else {
-                Log.e(TAG, "发送键盘报告失败")
+                val writeQueued = gatt.writeCharacteristic(characteristic)
+                if (!writeQueued) {
+                    writeCallback = null
+                    Log.e(TAG, "写入请求排队失败")
+                    continuation.resume(false)
+                } else {
+                    continuation.invokeOnCancellation {
+                        writeCallback = null
+                    }
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "发送键盘报告异常", e)
+                writeCallback = null
+                continuation.resume(false)
             }
-
-            return success
-
-        } catch (e: Exception) {
-            Log.e(TAG, "发送键盘报告异常", e)
-            return false
         }
     }
 
@@ -258,9 +315,102 @@ class BleHidManager(private val context: Context) {
         if (!sendKeyReport(modifier, keycode)) {
             return false
         }
-        kotlinx.coroutines.delay(50)
-        // 释放
+        // 短暂延迟确保设备处理按键按下事件
+        kotlinx.coroutines.delay(20)
+        // 释放所有键
         return sendKeyReport(0, 0)
+    }
+
+    /**
+     * 释放所有按键（发送空报告）
+     * 用于清理可能残留的按键状态
+     */
+    @SuppressLint("MissingPermission")
+    fun releaseAllKeys() {
+        try {
+            val characteristic = reportCharacteristic ?: return
+            val gatt = bluetoothGatt ?: return
+
+            // 构造空的 HID 键盘报告（带 Report ID 的8字节格式）
+            val report = ByteArray(REPORT_LENGTH)
+            report[0] = KEYBOARD_REPORT_ID
+            report[1] = 0x00  // 无修饰键
+            report[2] = 0x00
+            report[3] = 0x00
+            report[4] = 0x00
+            report[5] = 0x00
+            report[6] = 0x00
+            report[7] = 0x00
+
+            characteristic.value = report
+            gatt.writeCharacteristic(characteristic)
+            Log.d(TAG, "已发送释放所有按键报告")
+        } catch (e: Exception) {
+            Log.e(TAG, "释放按键失败", e)
+        }
+    }
+
+    /**
+     * 初始化时发送释放报告（同步等待）
+     * 这个方法只在服务发现完成后调用一次，用于确保初始状态正确
+     */
+    private fun sendInitialReleaseReportSync() {
+        try {
+            val characteristic = reportCharacteristic ?: run {
+                Log.w(TAG, "报告特征值为空，跳过初始释放报告")
+                return
+            }
+            val gatt = bluetoothGatt ?: run {
+                Log.w(TAG, "蓝牙GATT为空，跳过初始释放报告")
+                return
+            }
+
+            // 构造空的 HID 键盘报告（带 Report ID 的8字节格式）
+            val report = ByteArray(REPORT_LENGTH)
+            report[0] = KEYBOARD_REPORT_ID
+            report[1] = 0x00  // 无修饰键
+            report[2] = 0x00  // 保留
+            report[3] = 0x00  // 无按键
+            report[4] = 0x00
+            report[5] = 0x00
+            report[6] = 0x00
+            report[7] = 0x00
+
+            characteristic.value = report
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+
+            // 使用 CountDownLatch 等待写入完成
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val successHolder = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            // 临时保存旧的回调（此时应该为 null，因为是首次写入）
+            val oldCallback = writeCallback
+            writeCallback = { success ->
+                successHolder.set(success)
+                if (success) {
+                    Log.d(TAG, "初始释放报告发送成功")
+                } else {
+                    Log.e(TAG, "初始释放报告发送失败")
+                }
+                latch.countDown()
+            }
+
+            val writeQueued = gatt.writeCharacteristic(characteristic)
+            if (!writeQueued) {
+                Log.e(TAG, "初始释放报告写入请求排队失败")
+                writeCallback = oldCallback
+            } else {
+                // 等待写入完成，最多等待 2 秒
+                val completed = latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                if (!completed) {
+                    Log.w(TAG, "初始释放报告发送超时")
+                }
+                // 恢复旧的回调
+                writeCallback = oldCallback
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "发送初始释放报告异常", e)
+        }
     }
 
     /**
@@ -270,24 +420,68 @@ class BleHidManager(private val context: Context) {
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val device = gatt.device
+            val gattHash = System.identityHashCode(gatt)
+            val pendingHash = pendingConnectionGatt?.let { System.identityHashCode(it) }
+
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.d(TAG, "已连接到设备: ${device.name ?: "未知"}")
-                    _connectedDevice.value = device
-                    // 发现服务
-                    gatt.discoverServices()
+                    Log.d(TAG, "已连接到设备: ${device.name ?: "未知"} (GATT: $gattHash, 待定: $pendingHash)")
+
+                    // 检查这是否是我们正在等待的新连接
+                    if (pendingConnectionGatt == gatt) {
+                        // 这是新连接，更新状态
+                        _connectedDevice.value = device
+                        bluetoothGatt = gatt
+                        pendingConnectionGatt = null  // 连接成功，清除待定标记
+                        // 发现服务
+                        gatt.discoverServices()
+                    } else {
+                        // 这是旧连接的延迟回调，忽略
+                        Log.d(TAG, "忽略旧连接的延迟 CONNECTED 回调")
+                        // 关闭这个旧的 GATT
+                        try {
+                            gatt.disconnect()
+                            gatt.close()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "关闭旧 GATT 时出错", e)
+                        }
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    Log.d(TAG, "设备已断开: ${device.name ?: "未知"}")
-                    _connectionState.value = ConnectionState.Disconnected
-                    _connectedDevice.value = null
+                    Log.d(TAG, "设备已断开: ${device.name ?: "未知"} (GATT: $gattHash, 待定: $pendingHash, 当前: ${bluetoothGatt?.let { System.identityHashCode(it) }})")
+
+                    // 检查这是否是当前活动连接的断开
+                    if (bluetoothGatt == gatt) {
+                        // 这是当前活动连接的断开
+                        _connectionState.value = ConnectionState.Disconnected
+                        _connectedDevice.value = null
+                        bluetoothGatt = null
+                        reportCharacteristic = null
+                        Log.d(TAG, "当前连接已断开")
+                    } else if (pendingConnectionGatt == gatt) {
+                        // 这是正在建立的连接失败了
+                        _connectionState.value = ConnectionState.Error("连接失败")
+                        pendingConnectionGatt = null
+                        Log.e(TAG, "连接失败: status=$status")
+                    } else {
+                        // 这是旧连接的延迟回调，忽略
+                        Log.d(TAG, "忽略旧连接的延迟 DISCONNECTED 回调")
+                        // 确保旧 GATT 被关闭
+                        try {
+                            gatt.close()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "关闭旧 GATT 时出错", e)
+                        }
+                    }
                 }
                 BluetoothProfile.STATE_CONNECTING -> {
-                    Log.d(TAG, "正在连接...")
-                    _connectionState.value = ConnectionState.Connecting
+                    Log.d(TAG, "正在连接... (GATT: $gattHash)")
+                    if (pendingConnectionGatt == gatt) {
+                        _connectionState.value = ConnectionState.Connecting
+                    }
                 }
                 BluetoothProfile.STATE_DISCONNECTING -> {
-                    Log.d(TAG, "正在断开...")
+                    Log.d(TAG, "正在断开... (GATT: $gattHash)")
                 }
             }
         }
@@ -353,6 +547,9 @@ class BleHidManager(private val context: Context) {
                 _connectionState.value = ConnectionState.Connected
                 Log.d(TAG, "HID 服务准备就绪")
 
+                // 连接成功后立即发送一个"全释放"报告，确保设备没有残留的按键状态
+                sendInitialReleaseReportSync()
+
             } else {
                 Log.e(TAG, "服务发现失败: $status")
                 _connectionState.value = ConnectionState.Error("服务发现失败")
@@ -360,11 +557,13 @@ class BleHidManager(private val context: Context) {
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "特征值写入成功")
-            } else {
+            val success = status == BluetoothGatt.GATT_SUCCESS
+            if (!success) {
                 Log.e(TAG, "特征值写入失败: $status")
             }
+            // 通知等待中的协程写入已完成
+            writeCallback?.invoke(success)
+            writeCallback = null
         }
 
         override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {

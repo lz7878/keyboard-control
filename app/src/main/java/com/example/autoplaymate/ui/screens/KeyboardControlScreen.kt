@@ -542,11 +542,22 @@ fun ScriptActionsContent(
     // 从 ViewModel 获取脚本数据（持久化）
     val scriptSteps by viewModel.scriptSteps.collectAsStateWithLifecycle()
     val loopEnabled by viewModel.loopEnabled.collectAsStateWithLifecycle()
+    val scriptTemplates by viewModel.scriptTemplates.collectAsStateWithLifecycle()
 
     // 当前编辑的步骤
     var currentDelay by remember { mutableStateOf("1.0") }
     var currentKey by remember { mutableStateOf("F12") }
     var delayOnly by remember { mutableStateOf(false) }
+
+    // 异步重复相关
+    var asyncRepeatMode by remember { mutableStateOf(false) }
+    var repeatCount by remember { mutableStateOf("10") }
+    var repeatInterval by remember { mutableStateOf("500") }
+
+    // 脚本管理相关
+    var showSaveDialog by remember { mutableStateOf(false) }
+    var scriptName by remember { mutableStateOf("") }
+    var showScriptList by remember { mutableStateOf(false) }
 
     // 滚动状态
     val scrollState = rememberScrollState()
@@ -627,12 +638,84 @@ fun ScriptActionsContent(
                     ) {
                         Checkbox(
                             checked = delayOnly,
-                            onCheckedChange = { delayOnly = it }
+                            onCheckedChange = {
+                                delayOnly = it
+                                if (it) asyncRepeatMode = false
+                            }
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "纯延时（不按键）",
                             style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+
+                    // 异步重复模式选项
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = asyncRepeatMode,
+                            onCheckedChange = {
+                                asyncRepeatMode = it
+                                if (it) delayOnly = false
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "异步重复（后台执行）",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+
+                    // 异步重复参数设置
+                    if (asyncRepeatMode) {
+                        // 重复次数输入
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "重复次数:",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.width(80.dp)
+                            )
+                            OutlinedTextField(
+                                value = repeatCount,
+                                onValueChange = { repeatCount = it },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                placeholder = { Text("10") }
+                            )
+                        }
+
+                        // 重复间隔输入
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "间隔(ms):",
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.width(80.dp)
+                            )
+                            OutlinedTextField(
+                                value = repeatInterval,
+                                onValueChange = { repeatInterval = it },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                placeholder = { Text("500") }
+                            )
+                        }
+
+                        // 说明文字
+                        Text(
+                            text = "异步重复会在后台执行，不会阻塞后续步骤，每轮循环都会重新执行",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
                         )
                     }
 
@@ -642,11 +725,106 @@ fun ScriptActionsContent(
                             val delaySec = currentDelay.toDoubleOrNull() ?: 1.0
                             val delayMs = (delaySec * 1000).toLong()
                             val keyName = if (delayOnly) null else currentKey
-                            viewModel.addScriptStep(com.example.autoplaymate.data.ScriptStepData(delayMs, keyName))
+
+                            if (asyncRepeatMode && keyName != null) {
+                                // 异步重复步骤
+                                val count = repeatCount.toIntOrNull() ?: 10
+                                val interval = repeatInterval.toLongOrNull() ?: 500L
+                                viewModel.addScriptStep(
+                                    com.example.autoplaymate.data.ScriptStepData(
+                                        delayMs = delayMs,
+                                        keyName = keyName,
+                                        stepType = com.example.autoplaymate.data.StepType.ASYNC_REPEAT.name,
+                                        repeatCount = count,
+                                        repeatIntervalMs = interval
+                                    )
+                                )
+                            } else {
+                                // 普通步骤
+                                viewModel.addScriptStep(
+                                    com.example.autoplaymate.data.ScriptStepData(
+                                        delayMs = delayMs,
+                                        keyName = keyName,
+                                        stepType = com.example.autoplaymate.data.StepType.NORMAL.name
+                                    )
+                                )
+                            }
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("添加步骤")
+                    }
+                }
+            }
+
+            // 脚本管理区域
+            Card(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "脚本管理",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    // 脚本管理按钮
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                scriptName = ""
+                                showSaveDialog = true
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("保存脚本")
+                        }
+                        Button(
+                            onClick = {
+                                showScriptList = !showScriptList
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(if (showScriptList) "隐藏列表" else "脚本列表")
+                        }
+                    }
+
+                    // 已保存脚本列表
+                    if (showScriptList && scriptTemplates.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        scriptTemplates.forEach { template ->
+                            ScriptTemplateItem(
+                                name = template.name,
+                                stepCount = template.steps.size,
+                                loopEnabled = template.loopEnabled,
+                                onLoad = { viewModel.loadScriptTemplate(template.id) },
+                                onDelete = { viewModel.deleteScriptTemplate(template.id) }
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                        }
+                    } else if (showScriptList && scriptTemplates.isEmpty()) {
+                        Text(
+                            text = "暂无保存的脚本",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    // 新建脚本按钮
+                    Button(
+                        onClick = { viewModel.createNewScript() },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer
+                        )
+                    ) {
+                        Text("新建脚本")
                     }
                 }
             }
@@ -679,7 +857,13 @@ fun ScriptActionsContent(
                         scriptSteps.forEachIndexed { index, step ->
                             ScriptStepItem(
                                 index = index + 1,
-                                step = ScriptStepUi(step.delayMs, step.keyName),
+                                step = ScriptStepUi(
+                                    delayMs = step.delayMs,
+                                    keyName = step.keyName,
+                                    isAsyncRepeat = step.stepType == com.example.autoplaymate.data.StepType.ASYNC_REPEAT.name,
+                                    repeatCount = step.repeatCount,
+                                    repeatIntervalMs = step.repeatIntervalMs
+                                ),
                                 onDelete = {
                                     viewModel.removeScriptStep(index)
                                 }
@@ -736,10 +920,15 @@ fun ScriptActionsContent(
                                 } else {
                                     0 // 纯延时使用 keycode 0
                                 }
+                                // 检查是否是异步重复步骤
+                                val isAsyncRepeat = step.stepType == com.example.autoplaymate.data.StepType.ASYNC_REPEAT.name
                                 com.example.autoplaymate.viewmodel.KeyboardViewModel.ScriptStep(
                                     delayMs = step.delayMs,
                                     keycode = keycode.toByte(),
-                                    modifier = 0
+                                    modifier = 0,
+                                    isAsyncRepeat = isAsyncRepeat,
+                                    repeatCount = step.repeatCount,
+                                    repeatIntervalMs = step.repeatIntervalMs
                                 )
                             }
                             onRunScript(steps, loopEnabled)
@@ -765,6 +954,17 @@ fun ScriptActionsContent(
             }
         }
     }
+
+    // 保存脚本对话框
+    if (showSaveDialog) {
+        SaveScriptDialog(
+            onDismiss = { showSaveDialog = false },
+            onConfirm = { name ->
+                viewModel.saveAsScriptTemplate(name)
+                showSaveDialog = false
+            }
+        )
+    }
 }
 
 /**
@@ -772,7 +972,10 @@ fun ScriptActionsContent(
  */
 data class ScriptStepUi(
     val delayMs: Long,
-    val keyName: String?
+    val keyName: String?,
+    val isAsyncRepeat: Boolean = false,
+    val repeatCount: Int = 0,
+    val repeatIntervalMs: Long = 0
 )
 
 /**
@@ -788,7 +991,11 @@ fun ScriptStepItem(
         modifier = Modifier
             .fillMaxWidth()
             .background(
-                MaterialTheme.colorScheme.surfaceVariant,
+                if (step.isAsyncRepeat) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
+                },
                 RoundedCornerShape(8.dp)
             )
             .padding(12.dp),
@@ -796,16 +1003,28 @@ fun ScriptStepItem(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "步骤 $index",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                if (step.isAsyncRepeat) {
+                    Text(
+                        text = "异步",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
             Text(
-                text = "步骤 $index",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                text = if (step.keyName != null) {
-                    "${step.delayMs / 1000.0}s 后按下 ${step.keyName}"
-                } else {
-                    "纯延时 ${step.delayMs / 1000.0}s"
+                text = when {
+                    step.keyName == null -> "纯延时 ${step.delayMs / 1000.0}s"
+                    step.isAsyncRepeat -> "${step.delayMs / 1000.0}s 后异步重复 ${step.keyName} (${step.repeatCount}次, ${step.repeatIntervalMs}ms间隔)"
+                    else -> "${step.delayMs / 1000.0}s 后按下 ${step.keyName}"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -837,6 +1056,7 @@ fun KeyDropdown(
         "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
         "Space", "Enter", "Tab", "Esc", "Backspace",
         "Up", "Down", "Left", "Right",
+        "X", "G", "V",
         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
     )
 
@@ -1079,5 +1299,99 @@ fun getNumberKeycode(number: String): Byte? {
         "8" -> KeyCodes.KEY_8
         "9" -> KeyCodes.KEY_9
         else -> null
+    }
+}
+
+/**
+ * 保存脚本对话框
+ */
+@Composable
+fun SaveScriptDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    var scriptName by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("保存脚本") },
+        text = {
+            OutlinedTextField(
+                value = scriptName,
+                onValueChange = { scriptName = it },
+                label = { Text("脚本名称") },
+                singleLine = true
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (scriptName.isNotBlank()) {
+                        onConfirm(scriptName)
+                    }
+                },
+                enabled = scriptName.isNotBlank()
+            ) {
+                Text("保存")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        }
+    )
+}
+
+/**
+ * 脚本模板项
+ */
+@Composable
+fun ScriptTemplateItem(
+    name: String,
+    stepCount: Int,
+    loopEnabled: Boolean,
+    onLoad: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                MaterialTheme.colorScheme.surfaceVariant,
+                RoundedCornerShape(8.dp)
+            )
+            .padding(12.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(
+            modifier = Modifier.weight(1f)
+        ) {
+            Text(
+                text = name,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = "$stepCount 步" + if (loopEnabled) " • 循环" else "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            TextButton(onClick = onLoad) {
+                Text("加载")
+            }
+            IconButton(onClick = onDelete) {
+                Text(
+                    text = "×",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
     }
 }
